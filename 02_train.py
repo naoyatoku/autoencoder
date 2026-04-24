@@ -9,9 +9,10 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset, random_split
 from pathlib import Path
-import matplotlib.pyplot as plt
 import matplotlib
 matplotlib.use("Agg")  # GUIなし環境でも動作
+import matplotlib.pyplot as plt
+matplotlib.rcParams['font.family'] = 'Meiryo'
 
 DATA_DIR  = Path("data")
 MODEL_DIR = Path("models")
