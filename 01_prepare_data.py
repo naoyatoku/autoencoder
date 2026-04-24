@@ -22,11 +22,17 @@ LABELS_URL = "https://archive.ics.uci.edu/ml/machine-learning-databases/secom/se
 
 def download_if_needed(url: str, dest: Path) -> None:
     if dest.exists():
-        print(f"  既存ファイルを使用: {dest}")
+        print(f"  using existed file: {dest}")
         return
-    print(f"  ダウンロード中: {url}")
-    urllib.request.urlretrieve(url, dest)
-    print(f"  保存完了: {dest}")
+    print(f"  downloading.. : {url}")
+    import ssl
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    with urllib.request.urlopen(url, context=ctx) as response:
+        with open(dest, 'wb') as f:
+            f.write(response.read())
+    print(f"  saving finished : {dest}")
 
 
 def main():
