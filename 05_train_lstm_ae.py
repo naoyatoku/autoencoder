@@ -67,24 +67,51 @@ def make_windows(X: np.ndarray, window: int, stride: int) -> np.ndarray:
     return np.stack([X[i:i + window] for i in idxs])
 
 
-def window_scores(model, X: np.ndarray, window: int, batch: int = 256) -> np.ndarray:
+def compute_sensor_err_stats(model, X: np.ndarray, window: int, batch: int = 256):
+    """正常データからセンサーごとの再構成誤差の平均・標準偏差を計算して返す"""
+    model.eval()
+    wins   = make_windows(X, window, stride=1)
+    tensor = torch.tensor(wins, dtype=torch.float32)
+    all_err = []
+    for i in range(0, len(tensor), batch):
+        chunk = tensor[i:i + batch].to(DEVICE)
+        with torch.no_grad():
+            recon = model(chunk)
+        err = ((chunk - recon) ** 2).cpu().numpy()  # (B, window, sensors)
+        all_err.append(err.reshape(-1, X.shape[1]))
+    all_err = np.concatenate(all_err, axis=0)        # (N, sensors)
+    return all_err.mean(axis=0), all_err.std(axis=0).clip(min=1e-6)
+
+
+def window_scores(model, X: np.ndarray, window: int,
+                  sensor_mean=None, sensor_std=None, batch: int = 256) -> np.ndarray:
     """
-    各時刻の再構成誤差を計算
-    複数の窓にまたがる時刻はスコアを平均する
+    各時刻の異常スコアを計算。
+    sensor_mean/std が与えられた場合はセンサーごとにz-スコア化してから平均する。
+    z-スコア化により「1センサーだけ大きく外れる異常」と
+    「全センサーが少しずつ外れる異常」の両方を検出しやすくなる。
     """
-    T, S      = X.shape
-    scores    = np.zeros(T, dtype=np.float32)
-    counts    = np.zeros(T, dtype=np.float32)
+    T, S   = X.shape
+    scores = np.zeros(T, dtype=np.float32)
+    counts = np.zeros(T, dtype=np.float32)
     model.eval()
 
-    windows = make_windows(X, window, stride=1)   # stride=1 で全時刻をカバー
+    windows = make_windows(X, window, stride=1)
     tensor  = torch.tensor(windows, dtype=torch.float32)
+
+    s_mean = torch.tensor(sensor_mean, dtype=torch.float32).to(DEVICE) if sensor_mean is not None else None
+    s_std  = torch.tensor(sensor_std,  dtype=torch.float32).to(DEVICE) if sensor_std  is not None else None
 
     for i in range(0, len(tensor), batch):
         chunk = tensor[i:i + batch].to(DEVICE)
         with torch.no_grad():
             recon = model(chunk)
-        err = ((chunk - recon) ** 2).mean(dim=2).cpu().numpy()  # (B, window)
+        sq_err = (chunk - recon) ** 2                        # (B, window, sensors)
+        if s_mean is not None:
+            z = ((sq_err - s_mean) / s_std).clamp(min=0)    # 正常以下は0に切り捨て
+            err = z.mean(dim=2).cpu().numpy()                # (B, window)
+        else:
+            err = sq_err.mean(dim=2).cpu().numpy()
         for j, e in enumerate(err):
             t0 = i + j
             scores[t0:t0 + window] += e
@@ -164,13 +191,19 @@ def main():
     model.load_state_dict(torch.load(MODEL_DIR / "lstm_ae_best.pth", weights_only=True))
     print(f"\n  最良 val_loss = {best_val:.6f}")
 
-    print("\n=== 5. テストデータで異常スコア計算 ===")
-    print("  (全時刻の再構成誤差を計算中... しばらくかかります)")
-    scores = window_scores(model, X_test, WINDOW)
+    print("\n=== 5. センサー誤差統計の計算 ===")
+    print("  (正常データで各センサーの再構成誤差の平均・標準偏差を計算中...)")
+    s_mean, s_std = compute_sensor_err_stats(model, X_normal, WINDOW)
+    np.save(MODEL_DIR / "sensor_err_stats.npy", np.stack([s_mean, s_std]))
+    print(f"  保存: models/sensor_err_stats.npy")
+
+    print("\n=== 6. テストデータで異常スコア計算 ===")
+    print("  (z-スコア化した再構成誤差を計算中... しばらくかかります)")
+    scores = window_scores(model, X_test, WINDOW, sensor_mean=s_mean, sensor_std=s_std)
 
     # 正常区間スコアから閾値を決定
     normal_scores = scores[y_test == 0]
-    threshold = np.percentile(normal_scores, 95)
+    threshold = np.percentile(normal_scores, 80)
     y_pred    = (scores > threshold).astype(int)
 
     tp = int(((y_pred==1) & (y_test==1)).sum())
@@ -185,7 +218,7 @@ def main():
 
     np.save(MODEL_DIR / "ts_threshold.npy", np.array([threshold], dtype=np.float32))
 
-    print("\n=== 6. ONNX エクスポート ===")
+    print("\n=== 7. ONNX エクスポート ===")
     model.cpu().eval()
     dummy = torch.zeros(1, WINDOW, N_SENSORS)
     torch.onnx.export(
@@ -199,7 +232,7 @@ def main():
     )
     print(f"  保存: models/lstm_ae.onnx")
 
-    print("\n=== 7. グラフ保存 ===")
+    print("\n=== 8. グラフ保存 ===")
     fig, axes = plt.subplots(3, 1, figsize=(14, 10))
 
     axes[0].plot(train_losses, label="train")

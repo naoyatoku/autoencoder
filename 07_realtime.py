@@ -5,9 +5,9 @@ ts_X_test.npy のデータをリアルタイムストリームとして再生し
 LSTM-AE ONNX モデルで異常をリアルタイム検出します。
 
 注意:
-  リアルタイムでは各時刻のスコア = 直前 WINDOW 点の再構成誤差のみ使用。
-  05_train の評価（複数窓の平均）とは若干異なるため、
-  スコアの絶対値は高くなる傾向があります。
+  リアルタイムでは各時刻のスコア = 直前 WINDOW 点の z スコア化再構成誤差。
+  05_train の評価（複数窓の平均）とは若干異なるが、
+  同じ sensor_err_stats.npy で正規化しているため閾値はそのまま使用可能。
 
 使い方:
   python 07_realtime.py           # 実時間 (10 Hz = 100 ms/ステップ)
@@ -37,17 +37,22 @@ STEP_S = 1.0 / HZ
 # ---------------------------------------------------------------------------
 
 def load_runtime():
-    sess      = ort.InferenceSession(str(MODEL_DIR / "lstm_ae.onnx"),
-                                     providers=["CPUExecutionProvider"])
-    threshold = float(np.load(MODEL_DIR / "ts_threshold.npy")[0])
-    return sess, threshold
+    sess         = ort.InferenceSession(str(MODEL_DIR / "lstm_ae.onnx"),
+                                        providers=["CPUExecutionProvider"])
+    threshold    = float(np.load(MODEL_DIR / "ts_threshold.npy")[0])
+    sensor_stats = np.load(MODEL_DIR / "sensor_err_stats.npy")  # (2, sensors)
+    return sess, threshold, sensor_stats
 
 
-def score_window(sess, buf: np.ndarray) -> float:
-    """buf: (WINDOW, n_sensors) → 再構成誤差 (MSE)"""
-    x     = buf[np.newaxis].astype(np.float32)   # (1, W, S)
-    recon = sess.run(None, {"windows": x})[0]
-    return float(((x - recon) ** 2).mean())
+def score_window(sess, buf: np.ndarray, sensor_stats: np.ndarray) -> float:
+    """buf: (WINDOW, n_sensors) → z スコア化再構成誤差の平均"""
+    x      = buf[np.newaxis].astype(np.float32)   # (1, W, S)
+    recon  = sess.run(None, {"windows": x})[0]
+    sq_err = (x - recon) ** 2                     # (1, W, sensors)
+    s_mean = sensor_stats[0]
+    s_std  = sensor_stats[1]
+    z      = np.clip((sq_err - s_mean) / s_std, 0, None)
+    return float(z.mean())
 
 
 # ---------------------------------------------------------------------------
@@ -72,7 +77,7 @@ def find_segments(y: np.ndarray):
 # ストリーム処理
 # ---------------------------------------------------------------------------
 
-def run(sess, threshold, X, y, realtime: bool) -> np.ndarray:
+def run(sess, threshold, sensor_stats, X, y, realtime: bool) -> np.ndarray:
     T, n_sensors = X.shape
     buf    = collections.deque(maxlen=WINDOW)
     scores = np.full(T, np.nan, dtype=np.float32)
@@ -87,7 +92,7 @@ def run(sess, threshold, X, y, realtime: bool) -> np.ndarray:
     for t in range(T):
         buf.append(X[t])
         if len(buf) == WINDOW:
-            scores[t] = score_window(sess, np.array(buf))
+            scores[t] = score_window(sess, np.array(buf), sensor_stats)
 
         det   = bool(not np.isnan(scores[t]) and scores[t] > threshold)
         label = int(y[t])
@@ -246,7 +251,7 @@ def main():
     args = parser.parse_args()
 
     print("ONNX モデル読み込み中...")
-    sess, threshold = load_runtime()
+    sess, threshold, sensor_stats = load_runtime()
     print(f"  閾値: {threshold:.5f}  窓幅: {WINDOW} 点 ({WINDOW * 100} ms)")
 
     X = np.load(DATA_DIR / "ts_X_test.npy")
@@ -263,7 +268,7 @@ def main():
         print(f"\n[リアルタイムモード: {HZ} Hz]  完走まで約 {est:.0f} 秒")
         print("  速く試したい場合は --fast を付けてください。")
 
-    scores = run(sess, threshold, X, y, realtime=not args.fast)
+    scores = run(sess, threshold, sensor_stats, X, y, realtime=not args.fast)
     print_summary(scores, y, threshold, HZ)
 
     if args.plot:

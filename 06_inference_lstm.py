@@ -25,17 +25,51 @@ BATCH     = 256   # 推論バッチサイズ
 
 
 def load_runtime():
-    sess      = ort.InferenceSession(str(MODEL_DIR / "lstm_ae.onnx"),
-                                     providers=["CPUExecutionProvider"])
-    threshold = float(np.load(MODEL_DIR / "ts_threshold.npy")[0])
-    mean      = np.load(DATA_DIR / "ts_mean.npy")
-    scale     = np.load(DATA_DIR / "ts_scale.npy")
-    return sess, threshold, mean, scale
+    sess           = ort.InferenceSession(str(MODEL_DIR / "lstm_ae.onnx"),
+                                          providers=["CPUExecutionProvider"])
+    threshold      = float(np.load(MODEL_DIR / "ts_threshold.npy")[0])
+    mean           = np.load(DATA_DIR / "ts_mean.npy")
+    scale          = np.load(DATA_DIR / "ts_scale.npy")
+    sensor_stats   = np.load(MODEL_DIR / "sensor_err_stats.npy")  # (2, sensors)
+    return sess, threshold, mean, scale, sensor_stats
 
 
-def compute_scores(sess, X_scaled: np.ndarray) -> np.ndarray:
+def eval_single_sensor(X_scaled: np.ndarray, y_true: np.ndarray, roll_w: int = 200):
     """
-    各時刻の異常スコア（再構成誤差）を計算
+    ローリング平均偏差ベースの単センサー監視との比較。
+    roll_w 点（デフォルト=20秒）のウィンドウ内平均からの最大偏差をスコアに使う。
+    decorrelation 異常は平均も分散も変わらないため、このスコアが上がらない。
+    """
+    T, S = X_scaled.shape
+
+    # 累積和でローリング平均を O(T) で計算
+    padded = np.vstack([np.zeros((1, S), dtype=np.float32), X_scaled])  # (T+1, S)
+    cumsum = np.cumsum(padded, axis=0)
+    idx_end   = np.arange(1, T + 1)
+    idx_start = np.maximum(0, idx_end - roll_w)
+    counts    = (idx_end - idx_start).reshape(-1, 1)
+    roll_mean = (cumsum[idx_end] - cumsum[idx_start]) / counts   # (T, S)
+
+    max_dev = np.abs(X_scaled - roll_mean).max(axis=1)   # 全センサー中の最大偏差 (T,)
+
+    print("\n  --- 単センサーローリング監視との比較（窓幅20秒）---")
+    print(f"  {'閾値(σ)':>8}  {'Precision':>10}  {'Recall':>8}  {'F1':>6}")
+    print("  " + "-" * 42)
+    for thr in [0.3, 0.5, 0.8, 1.0, 1.5, 2.0]:
+        flagged = max_dev > thr
+        tp = int((flagged  & (y_true == 1)).sum())
+        fp = int((flagged  & (y_true == 0)).sum())
+        fn = int((~flagged & (y_true == 1)).sum())
+        pr = tp / (tp + fp + 1e-9)
+        rc = tp / (tp + fn + 1e-9)
+        f1 = 2 * pr * rc / (pr + rc + 1e-9)
+        print(f"  {thr:>8.1f}  {pr:>10.3f}  {rc:>8.3f}  {f1:>6.3f}")
+    print("  ※ decorrelation 異常は各センサーの平均・分散が変わらないため F1~=0 が期待値")
+
+
+def compute_scores(sess, X_scaled: np.ndarray, sensor_stats: np.ndarray) -> np.ndarray:
+    """
+    各時刻の異常スコアを計算。センサーごとのz-スコア化を使用。
     X_scaled: (T, n_sensors) — 正規化済み
     戻り値  : (T,) の異常スコア配列
     """
@@ -43,17 +77,21 @@ def compute_scores(sess, X_scaled: np.ndarray) -> np.ndarray:
     scores = np.zeros(T, dtype=np.float32)
     counts = np.zeros(T, dtype=np.float32)
 
-    # 全時刻の窓を一括作成
+    s_mean = sensor_stats[0]   # (sensors,)
+    s_std  = sensor_stats[1]   # (sensors,)
+
     n_windows = T - WINDOW + 1
     if n_windows <= 0:
         print(f"エラー: データ長 ({T}) が窓幅 ({WINDOW}) より短いです")
         return scores
 
     for start in range(0, n_windows, BATCH):
-        end   = min(start + BATCH, n_windows)
-        batch = np.stack([X_scaled[i:i + WINDOW] for i in range(start, end)])
-        recon = sess.run(None, {"windows": batch.astype(np.float32)})[0]
-        err   = ((batch - recon) ** 2).mean(axis=2)   # (B, window)
+        end    = min(start + BATCH, n_windows)
+        batch  = np.stack([X_scaled[i:i + WINDOW] for i in range(start, end)])
+        recon  = sess.run(None, {"windows": batch.astype(np.float32)})[0]
+        sq_err = (batch - recon) ** 2                              # (B, window, sensors)
+        z      = np.clip((sq_err - s_mean) / s_std, 0, None)      # z-スコア化、負は0
+        err    = z.mean(axis=2)                                    # (B, window)
         for j, e in enumerate(err):
             t0 = start + j
             scores[t0:t0 + WINDOW] += e
@@ -99,19 +137,22 @@ def print_summary(scores, flags, y_true=None, threshold=0.0):
         print(f"  ... 合計 {shown} 区間")
 
 
-def demo_mode(sess, threshold, mean, scale):
+def demo_mode(sess, threshold, mean, scale, sensor_stats):
     print("=== デモモード: 合成テストデータで検証 ===")
-    X_test = np.load(DATA_DIR / "ts_X_test.npy")   # すでに正規化済み
+    X_test = np.load(DATA_DIR / "ts_X_test.npy")
     y_test = np.load(DATA_DIR / "ts_y_test.npy")
 
     print(f"  データ: {X_test.shape[0]}点 × {X_test.shape[1]}センサー")
+    print(f"  異常ラベル比率: {y_test.mean()*100:.1f}%")
+    print("\n  [LSTM-AE]")
     print("  スコア計算中...")
-    scores = compute_scores(sess, X_test)
+    scores = compute_scores(sess, X_test, sensor_stats)
     flags  = scores > threshold
     print_summary(scores, flags, y_test, threshold)
+    eval_single_sensor(X_test, y_test)
 
 
-def csv_mode(sess, threshold, mean, scale, csv_path: str):
+def csv_mode(sess, threshold, mean, scale, sensor_stats, csv_path: str):
     print(f"=== CSV推論モード: {csv_path} ===")
     import csv
     rows = []
@@ -127,7 +168,7 @@ def csv_mode(sess, threshold, mean, scale, csv_path: str):
     X_scaled = ((X_raw - mean) / scale).astype(np.float32)
     print(f"  データ: {X_scaled.shape[0]}点 × {X_scaled.shape[1]}センサー")
     print("  スコア計算中...")
-    scores = compute_scores(sess, X_scaled)
+    scores = compute_scores(sess, X_scaled, sensor_stats)
     flags  = scores > threshold
     print_summary(scores, flags, threshold=threshold)
 
@@ -138,13 +179,13 @@ def main():
     args = parser.parse_args()
 
     print("ONNX モデル読み込み中...")
-    sess, threshold, mean, scale = load_runtime()
+    sess, threshold, mean, scale, sensor_stats = load_runtime()
     print(f"  センサー数: {len(mean)}  窓幅: {WINDOW}点 ({WINDOW*100}ms)  閾値: {threshold:.4f}")
 
     if args.csv:
-        csv_mode(sess, threshold, mean, scale, args.csv)
+        csv_mode(sess, threshold, mean, scale, sensor_stats, args.csv)
     else:
-        demo_mode(sess, threshold, mean, scale)
+        demo_mode(sess, threshold, mean, scale, sensor_stats)
 
 
 if __name__ == "__main__":
