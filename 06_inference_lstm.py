@@ -20,7 +20,7 @@ from pathlib import Path
 
 MODEL_DIR = Path("models")
 DATA_DIR  = Path("data")
-WINDOW    = 50    # 学習時と合わせる（5秒分）
+WINDOW    = 200   # 学習時と合わせる（20秒分）
 BATCH     = 256   # 推論バッチサイズ
 
 
@@ -31,7 +31,8 @@ def load_runtime():
     mean           = np.load(DATA_DIR / "ts_mean.npy")
     scale          = np.load(DATA_DIR / "ts_scale.npy")
     sensor_stats   = np.load(MODEL_DIR / "sensor_err_stats.npy")  # (2, sensors)
-    return sess, threshold, mean, scale, sensor_stats
+    groups         = np.load(DATA_DIR / "ts_groups.npy")          # (5, 4)
+    return sess, threshold, mean, scale, sensor_stats, groups
 
 
 def eval_single_sensor(X_scaled: np.ndarray, y_true: np.ndarray, roll_w: int = 200):
@@ -67,11 +68,12 @@ def eval_single_sensor(X_scaled: np.ndarray, y_true: np.ndarray, roll_w: int = 2
     print("  ※ decorrelation 異常は各センサーの平均・分散が変わらないため F1~=0 が期待値")
 
 
-def compute_scores(sess, X_scaled: np.ndarray, sensor_stats: np.ndarray) -> np.ndarray:
+def compute_scores(sess, X_scaled: np.ndarray, sensor_stats: np.ndarray,
+                   groups: np.ndarray) -> np.ndarray:
     """
-    各時刻の異常スコアを計算。センサーごとのz-スコア化を使用。
-    X_scaled: (T, n_sensors) — 正規化済み
-    戻り値  : (T,) の異常スコア配列
+    各時刻の異常スコアを計算。
+    グループ内z-スコア平均 → グループ間最大値 を使い、
+    異常センサー2本の信号が残り18本で希釈されるのを防ぐ。
     """
     T = len(X_scaled)
     scores = np.zeros(T, dtype=np.float32)
@@ -89,12 +91,14 @@ def compute_scores(sess, X_scaled: np.ndarray, sensor_stats: np.ndarray) -> np.n
         end    = min(start + BATCH, n_windows)
         batch  = np.stack([X_scaled[i:i + WINDOW] for i in range(start, end)])
         recon  = sess.run(None, {"windows": batch.astype(np.float32)})[0]
-        sq_err = (batch - recon) ** 2                              # (B, window, sensors)
-        z      = np.clip((sq_err - s_mean) / s_std, 0, None)      # z-スコア化、負は0
-        err    = z.mean(axis=2)                                    # (B, window)
-        for j, e in enumerate(err):
+        sq_err   = (batch - recon) ** 2                              # (B, W, S)
+        z        = np.clip((sq_err - s_mean) / s_std, 0, None)    # z-スコア化、負は0
+        # グループ内（全timestep × 全sensor）を平均 → グループ間最大 → 窓スコア (B,)
+        g_means  = np.stack([z[:, :, g].mean(axis=(1, 2)) for g in groups], axis=-1)  # (B, G)
+        win_sc   = g_means.max(axis=-1)                            # (B,)
+        for j, sc in enumerate(win_sc):
             t0 = start + j
-            scores[t0:t0 + WINDOW] += e
+            scores[t0:t0 + WINDOW] += sc
             counts[t0:t0 + WINDOW] += 1
 
     return scores / np.maximum(counts, 1)
@@ -137,7 +141,7 @@ def print_summary(scores, flags, y_true=None, threshold=0.0):
         print(f"  ... 合計 {shown} 区間")
 
 
-def demo_mode(sess, threshold, mean, scale, sensor_stats):
+def demo_mode(sess, threshold, mean, scale, sensor_stats, groups):
     print("=== デモモード: 合成テストデータで検証 ===")
     X_test = np.load(DATA_DIR / "ts_X_test.npy")
     y_test = np.load(DATA_DIR / "ts_y_test.npy")
@@ -146,13 +150,13 @@ def demo_mode(sess, threshold, mean, scale, sensor_stats):
     print(f"  異常ラベル比率: {y_test.mean()*100:.1f}%")
     print("\n  [LSTM-AE]")
     print("  スコア計算中...")
-    scores = compute_scores(sess, X_test, sensor_stats)
+    scores = compute_scores(sess, X_test, sensor_stats, groups)
     flags  = scores > threshold
     print_summary(scores, flags, y_test, threshold)
     eval_single_sensor(X_test, y_test)
 
 
-def csv_mode(sess, threshold, mean, scale, sensor_stats, csv_path: str):
+def csv_mode(sess, threshold, mean, scale, sensor_stats, groups, csv_path: str):
     print(f"=== CSV推論モード: {csv_path} ===")
     import csv
     rows = []
@@ -168,7 +172,7 @@ def csv_mode(sess, threshold, mean, scale, sensor_stats, csv_path: str):
     X_scaled = ((X_raw - mean) / scale).astype(np.float32)
     print(f"  データ: {X_scaled.shape[0]}点 × {X_scaled.shape[1]}センサー")
     print("  スコア計算中...")
-    scores = compute_scores(sess, X_scaled, sensor_stats)
+    scores = compute_scores(sess, X_scaled, sensor_stats, groups)
     flags  = scores > threshold
     print_summary(scores, flags, threshold=threshold)
 
@@ -179,13 +183,13 @@ def main():
     args = parser.parse_args()
 
     print("ONNX モデル読み込み中...")
-    sess, threshold, mean, scale, sensor_stats = load_runtime()
+    sess, threshold, mean, scale, sensor_stats, groups = load_runtime()
     print(f"  センサー数: {len(mean)}  窓幅: {WINDOW}点 ({WINDOW*100}ms)  閾値: {threshold:.4f}")
 
     if args.csv:
-        csv_mode(sess, threshold, mean, scale, sensor_stats, args.csv)
+        csv_mode(sess, threshold, mean, scale, sensor_stats, groups, args.csv)
     else:
-        demo_mode(sess, threshold, mean, scale, sensor_stats)
+        demo_mode(sess, threshold, mean, scale, sensor_stats, groups)
 
 
 if __name__ == "__main__":

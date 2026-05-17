@@ -27,7 +27,7 @@ from pathlib import Path
 MODEL_DIR = Path("models")
 DATA_DIR  = Path("data")
 
-WINDOW = 50
+WINDOW = 200
 HZ     = 10
 STEP_S = 1.0 / HZ
 
@@ -41,18 +41,23 @@ def load_runtime():
                                         providers=["CPUExecutionProvider"])
     threshold    = float(np.load(MODEL_DIR / "ts_threshold.npy")[0])
     sensor_stats = np.load(MODEL_DIR / "sensor_err_stats.npy")  # (2, sensors)
-    return sess, threshold, sensor_stats
+    groups       = np.load(DATA_DIR  / "ts_groups.npy")         # (5, 4)
+    return sess, threshold, sensor_stats, groups
 
 
-def score_window(sess, buf: np.ndarray, sensor_stats: np.ndarray) -> float:
-    """buf: (WINDOW, n_sensors) → z スコア化再構成誤差の平均"""
+def score_window(sess, buf: np.ndarray, sensor_stats: np.ndarray,
+                 groups: np.ndarray) -> float:
+    """buf: (WINDOW, n_sensors) → グループ最大z-スコア（窓×センサー全体を平均してからmax）"""
     x      = buf[np.newaxis].astype(np.float32)   # (1, W, S)
     recon  = sess.run(None, {"windows": x})[0]
-    sq_err = (x - recon) ** 2                     # (1, W, sensors)
+    sq_err = (x - recon) ** 2                     # (1, W, S)
     s_mean = sensor_stats[0]
     s_std  = sensor_stats[1]
-    z      = np.clip((sq_err - s_mean) / s_std, 0, None)
-    return float(z.mean())
+    z      = np.clip((sq_err - s_mean) / s_std, 0, None)     # (1, W, S)
+    # グループ内（全timestep × 全sensor）を平均 → グループ間最大
+    # 先に大量平均で分散を下げてからmaxを取ることでノイズを抑制
+    g_means = np.array([z[0, :, g].mean() for g in groups])  # (n_groups,)
+    return float(g_means.max())
 
 
 # ---------------------------------------------------------------------------
@@ -77,7 +82,7 @@ def find_segments(y: np.ndarray):
 # ストリーム処理
 # ---------------------------------------------------------------------------
 
-def run(sess, threshold, sensor_stats, X, y, realtime: bool) -> np.ndarray:
+def run(sess, threshold, sensor_stats, groups, X, y, realtime: bool) -> np.ndarray:
     T, n_sensors = X.shape
     buf    = collections.deque(maxlen=WINDOW)
     scores = np.full(T, np.nan, dtype=np.float32)
@@ -92,7 +97,7 @@ def run(sess, threshold, sensor_stats, X, y, realtime: bool) -> np.ndarray:
     for t in range(T):
         buf.append(X[t])
         if len(buf) == WINDOW:
-            scores[t] = score_window(sess, np.array(buf), sensor_stats)
+            scores[t] = score_window(sess, np.array(buf), sensor_stats, groups)
 
         det   = bool(not np.isnan(scores[t]) and scores[t] > threshold)
         label = int(y[t])
@@ -251,7 +256,7 @@ def main():
     args = parser.parse_args()
 
     print("ONNX モデル読み込み中...")
-    sess, threshold, sensor_stats = load_runtime()
+    sess, threshold, sensor_stats, groups = load_runtime()
     print(f"  閾値: {threshold:.5f}  窓幅: {WINDOW} 点 ({WINDOW * 100} ms)")
 
     X = np.load(DATA_DIR / "ts_X_test.npy")
@@ -268,7 +273,7 @@ def main():
         print(f"\n[リアルタイムモード: {HZ} Hz]  完走まで約 {est:.0f} 秒")
         print("  速く試したい場合は --fast を付けてください。")
 
-    scores = run(sess, threshold, sensor_stats, X, y, realtime=not args.fast)
+    scores = run(sess, threshold, sensor_stats, groups, X, y, realtime=not args.fast)
     print_summary(scores, y, threshold, HZ)
 
     if args.plot:

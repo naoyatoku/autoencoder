@@ -26,14 +26,15 @@ DATA_DIR  = Path("data")
 MODEL_DIR = Path("models")
 MODEL_DIR.mkdir(exist_ok=True)
 
-WINDOW    = 50       # 5秒分 (50点 × 100ms)
-STRIDE    = 10       # 学習時のスライド幅
-LATENT    = 32       # 潜在空間の次元
-HIDDEN    = 64       # LSTMの隠れ層サイズ
-EPOCHS    = 60
-BATCH     = 128
-LR        = 1e-3
-DEVICE    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+WINDOW       = 200      # 20秒分 (200点 × 100ms) — グループ因子1〜2周期が収まる
+STRIDE       = 20       # 学習時のスライド幅
+LATENT       = 32       # 潜在空間の次元
+HIDDEN       = 64       # LSTMの隠れ層サイズ
+EPOCHS       = 100
+BATCH        = 128
+LR           = 1e-3
+CORR_LAMBDA  = 0.2      # グループ内相関損失の重み
+DEVICE       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 class LSTMAutoencoder(nn.Module):
@@ -61,6 +62,25 @@ class LSTMAutoencoder(nn.Module):
         return self.out_fc(out)                    # (batch, window, n_sensors)
 
 
+def group_corr_loss(x: torch.Tensor, recon: torch.Tensor, groups: list) -> torch.Tensor:
+    """グループ内センサー間相関をモデルが保持するよう促す補助損失。
+    正常データでの学習中に各グループのセンサー間相関をエンコーダに刷り込む。"""
+    loss = torch.zeros(1, device=x.device, dtype=x.dtype)
+    n = 0
+    for g in groups:
+        for i in range(len(g)):
+            for j in range(i + 1, len(g)):
+                xi = x[:, :, g[i]] - x[:, :, g[i]].mean(dim=1, keepdim=True)
+                xj = x[:, :, g[j]] - x[:, :, g[j]].mean(dim=1, keepdim=True)
+                ri = recon[:, :, g[i]] - recon[:, :, g[i]].mean(dim=1, keepdim=True)
+                rj = recon[:, :, g[j]] - recon[:, :, g[j]].mean(dim=1, keepdim=True)
+                cx = (xi * xj).sum(dim=1) / (xi.norm(dim=1) * xj.norm(dim=1) + 1e-8)
+                cr = (ri * rj).sum(dim=1) / (ri.norm(dim=1) * rj.norm(dim=1) + 1e-8)
+                loss = loss + ((cx - cr) ** 2).mean()
+                n += 1
+    return loss / max(n, 1)
+
+
 def make_windows(X: np.ndarray, window: int, stride: int) -> np.ndarray:
     """(T, sensors) → (N_windows, window, sensors)"""
     idxs = range(0, len(X) - window + 1, stride)
@@ -84,12 +104,11 @@ def compute_sensor_err_stats(model, X: np.ndarray, window: int, batch: int = 256
 
 
 def window_scores(model, X: np.ndarray, window: int,
-                  sensor_mean=None, sensor_std=None, batch: int = 256) -> np.ndarray:
+                  sensor_mean=None, sensor_std=None, groups=None, batch: int = 256) -> np.ndarray:
     """
     各時刻の異常スコアを計算。
-    sensor_mean/std が与えられた場合はセンサーごとにz-スコア化してから平均する。
-    z-スコア化により「1センサーだけ大きく外れる異常」と
-    「全センサーが少しずつ外れる異常」の両方を検出しやすくなる。
+    グループ構造が与えられた場合、グループ内z-スコア平均→グループ間最大値 を使う。
+    2センサー分の異常信号が18センサーで希釈されなくなる。
     """
     T, S   = X.shape
     scores = np.zeros(T, dtype=np.float32)
@@ -109,7 +128,17 @@ def window_scores(model, X: np.ndarray, window: int,
         sq_err = (chunk - recon) ** 2                        # (B, window, sensors)
         if s_mean is not None:
             z = ((sq_err - s_mean) / s_std).clamp(min=0)    # 正常以下は0に切り捨て
-            err = z.mean(dim=2).cpu().numpy()                # (B, window)
+            if groups is not None:
+                # グループ内（全timestep × 全sensor）を平均 → グループ間最大 → 窓スコア (B,)
+                g_means = torch.stack([z[:, :, g].mean(dim=[1, 2]) for g in groups], dim=-1)  # (B, G)
+                win_sc  = g_means.max(dim=-1).values.cpu().numpy()  # (B,)
+                for j, sc in enumerate(win_sc):
+                    t0 = i + j
+                    scores[t0:t0 + window] += sc
+                    counts[t0:t0 + window] += 1
+                continue  # 下の共通ループをスキップ
+            else:
+                err = z.mean(dim=2).cpu().numpy()            # (B, window)
         else:
             err = sq_err.mean(dim=2).cpu().numpy()
         for j, e in enumerate(err):
@@ -129,6 +158,10 @@ def main():
     y_test   = np.load(DATA_DIR / "ts_y_test.npy")
     N_SENSORS = X_normal.shape[1]
     print(f"  正常: {X_normal.shape}  テスト: {X_test.shape}  センサー数: {N_SENSORS}")
+
+    groups_np   = np.load(DATA_DIR / "ts_groups.npy")   # (5, 4)
+    groups_list = [list(g) for g in groups_np]
+    print(f"  グループ構造: {groups_list}")
 
     print("\n=== 2. 窓データ作成 ===")
     wins = make_windows(X_normal, WINDOW, STRIDE)
@@ -163,7 +196,8 @@ def main():
         for (batch,) in train_loader:
             batch = batch.to(DEVICE)
             optimizer.zero_grad()
-            loss = criterion(model(batch), batch)
+            recon = model(batch)
+            loss  = criterion(recon, batch) + CORR_LAMBDA * group_corr_loss(batch, recon, groups_list)
             loss.backward()
             optimizer.step()
             tr_loss += loss.item() * len(batch)
@@ -174,7 +208,9 @@ def main():
         for (batch,) in val_loader:
             batch = batch.to(DEVICE)
             with torch.no_grad():
-                vl_loss += criterion(model(batch), batch).item() * len(batch)
+                recon    = model(batch)
+                vl_loss += (criterion(recon, batch)
+                            + CORR_LAMBDA * group_corr_loss(batch, recon, groups_list)).item() * len(batch)
         vl_loss /= n_val
 
         scheduler.step(vl_loss)
@@ -198,12 +234,13 @@ def main():
     print(f"  保存: models/sensor_err_stats.npy")
 
     print("\n=== 6. テストデータで異常スコア計算 ===")
-    print("  (z-スコア化した再構成誤差を計算中... しばらくかかります)")
-    scores = window_scores(model, X_test, WINDOW, sensor_mean=s_mean, sensor_std=s_std)
+    print("  (グループ最大z-スコアを計算中... しばらくかかります)")
+    scores = window_scores(model, X_test, WINDOW, sensor_mean=s_mean, sensor_std=s_std,
+                           groups=groups_list)
 
-    # 正常区間スコアから閾値を決定
+    # 正常区間スコアから閾値を決定（99パーセンタイルで誤報率を抑制）
     normal_scores = scores[y_test == 0]
-    threshold = np.percentile(normal_scores, 80)
+    threshold = np.percentile(normal_scores, 99)
     y_pred    = (scores > threshold).astype(int)
 
     tp = int(((y_pred==1) & (y_test==1)).sum())

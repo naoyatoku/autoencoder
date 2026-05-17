@@ -1,12 +1,5 @@
 # 異常検知プロジェクト — 進捗メモ
 
-## 概要
-
-半導体製造装置センサーを想定した時系列データに対し、
-LSTM-Autoencoder (ONNX Runtime) でリアルタイム異常検知を行うパイプライン。
-
-**テーマ: 単センサー監視では検知不可能な異常を LSTM-AE で検知する**
-
 ---
 
 ## ファイル構成
@@ -16,134 +9,175 @@ LSTM-Autoencoder (ONNX Runtime) でリアルタイム異常検知を行うパイ
 | `01_prepare_data.py` | SECOM データセット取得・前処理 | 完成（今後は使わない） |
 | `02_train.py` | テーブルデータ用 AE 学習 | 完成（今後は使わない） |
 | `03_inference.py` | テーブルデータ用 ONNX 推論 | 完成（今後は使わない） |
-| `04_timeseries_data.py` | 合成時系列データ生成（グループ相関構造 + decorrelation 異常） | 完成・使用中 |
-| `05_train_lstm_ae.py` | LSTM-AE 学習 → ONNX エクスポート（z スコア正規化スコア） | 完成・使用中 |
-| `06_inference_lstm.py` | LSTM-AE ONNX 推論（単センサー監視との比較付き） | 完成 |
-| `07_realtime.py` | **リアルタイム検知デモ（本命）** | 完成（z スコア対応済み） |
-| `compare_anomaly_types.py` | 旧 4 異常タイプの検出能力比較（参考用） | 完成 |
-| `visualize_anomalies.py` | 旧 4 異常タイプの波形サンプル描画 | 完成 |
-
-> SECOM 関連（01〜03）は今後は触らない方針。04〜07 が主軸。
+| `04_timeseries_data.py` | 合成時系列データ生成（グループ相関構造 + decorrelation 異常） | 完成 |
+| `05_train_lstm_ae.py` | LSTM-AE 学習 → ONNX エクスポート | 改修中 |
+| `06_inference_lstm.py` | LSTM-AE ONNX 推論 | 改修中 |
+| `07_realtime.py` | リアルタイム検知デモ | 改修中 |
+| `visualize_data.py` | データ可視化（正常・異常・相関） | 完成 |
 
 ---
 
-## データ生成の設計（04_timeseries_data.py）
+## データ設計（04_timeseries_data.py）
 
 ### グループ相関構造
-
 ```
 5グループ × 4センサー = 20センサー
 sensor_signal = base + coupling * group_factor + 個別振動 + ノイズ
 ```
 
-同グループのセンサーは共通の潜在因子 (group_factor) で連動している。
-正常時はグループ内の相関係数が高い (avg ~0.7〜0.9)。
+### 異常パターン: Decorrelation のみ
+グループ後半 2 センサーの group_factor を**同振幅・同周波数帯のランダム位相サイン波**に置換。
 
-### 異常パターン: Decorrelation
-
-グループ後半 2 センサーの group_factor を **同振幅・同周波数帯のランダム位相サイン波**に置換。
-
-- 各センサーの平均・分散・自己相関は変わらない → **単センサー監視では検知不可**
-- グループ内センサー間の相関だけが崩れる → **LSTM-AE で初めて検知可能**
-
-白色ノイズでなくサイン波を使う理由：白色ノイズは高周波成分で単センサー監視でも
-ローリング平均偏差が上がってしまうため、時系列特性を保つサイン波を採用。
+- 各センサーの平均・分散・自己相関は変わらない → **単センサー監視では検知不可（設計通り）**
+- グループ内センサー間の相関だけが崩れる → LSTM-AE で検知
 
 ---
 
-## 異常スコアの設計（05_train / 06_inference / 07_realtime）
+## 2026-05-17 セッションの作業内容
 
-### z スコア正規化
+### 1. 可視化追加（visualize_data.py）✅
 
-再構成誤差を「正常データでの各センサーの再構成誤差統計」で正規化：
+以下の 2 グラフを新規追加、動作確認済み:
 
-```
-z = clip((sq_err - sensor_mean) / sensor_std, 0, None)
-score = z.mean()
-```
+- `models/viz_group_corr.png` — グループ内センサーのローリング相関時系列  
+  → 正常時は 0.7〜0.9 を維持、異常区間で急落する様子が見える
+- `models/viz_scatter.png` — 正常 vs 異常区間のセンサーペア散布図  
+  → 正常=直線（高相関）、異常=雲状（相関崩壊）
 
-- `sensor_err_stats.npy` に正常データの (mean, std) を保存
-- 正常以下（z < 0）はゼロに切り捨て → 正常区間スコアが安定する
-- decorrelation 時は複数センサーの z が同時上昇 → 合算で検知感度が上がる
-- 閾値は正常スコアの 80%ile（05_train が計算して ts_threshold.npy に保存）
+**「正常と異常が見た目で同じ」という疑問に対する回答:** 設計通り正しい。  
+1 センサー単体では区別不可能だが、グループ内センサー間の相関が崩れる。
 
 ---
 
-## 実行手順（別 PC でのセットアップ）
+### 2. モデル学習の改善（05_train_lstm_ae.py）✅
 
-### 1. 依存ライブラリのインストール
+追加内容:
+- `CORR_LAMBDA = 0.2` を定数追加
+- `group_corr_loss()` 関数追加：グループ内センサー間相関を保持する補助損失
+  ```python
+  loss = MSE + 0.2 * group_corr_loss(batch, recon, groups_list)
+  ```
+- 学習済みモデル: val_loss = 0.117290（100 エポック、CPU）
+- ONNX エクスポート済み
 
-```bash
-pip install -r requirements.txt
+---
+
+### 3. スコアリング方式の変更（05/06/07）⚠️ 途中
+
+**変更の意図:** 異常センサー 2 本の信号が残り 18 本で希釈されるのを防ぐため、  
+グループ構造を活かした集計方式に変更。
+
+**採用方式:**
 ```
-
-> **Windows の場合**: PyTorch が動かない場合は Visual C++ 再頒布可能パッケージが必要。  
-> https://aka.ms/vs/17/release/vc_redist.x64.exe をインストールすること。
-
-### 2. パイプライン実行順序
-
-```bash
-python 04_timeseries_data.py        # データ生成（data/ 以下に保存）
-python 05_train_lstm_ae.py          # LSTM-AE 学習（models/ 以下に保存）
-python 07_realtime.py --fast --plot # リアルタイム検知デモ
-python 06_inference_lstm.py         # バッチ推論 + 単センサー監視との比較
+グループ内全値（WINDOW × センサー数）を平均 → グループ間で最大
 ```
 
-> `data/` と `models/` は .gitignore に含まれるため、別 PC では上記を再実行する必要がある。
+各ファイルの変更内容:
+
+```python
+# 07_realtime.py: score_window()
+g_means = np.array([z[0, :, g].mean() for g in groups])  # (n_groups,)
+return float(g_means.max())
+
+# 06_inference_lstm.py: compute_scores()
+g_means = np.stack([z[:,:,g].mean(axis=(1,2)) for g in groups], axis=-1)  # (B, G)
+win_sc  = g_means.max(axis=-1)  # (B,)
+
+# 05_train_lstm_ae.py: window_scores()
+g_means = torch.stack([z[:,:,g].mean(dim=[1,2]) for g in groups], dim=-1)  # (B, G)
+win_sc  = g_means.max(dim=-1).values  # (B,)
+```
+
+`ts_groups.npy` を `load_runtime()` で読み込む変更も全ファイルに実施済み。
 
 ---
 
-## 直近の実験結果（2026-05-08、旧アプローチ）
+### 4. 閾値キャリブレーション問題（未解決・中断箇所）❌
 
-> ⚠️ 以下は旧アプローチ（spike / level_shift / volatility / stuck）での結果。
-> 現在は decorrelation アプローチに移行済みのため、再実行で結果が変わる。
+**根本原因: 訓練データとテストデータのスコア分布が大きくずれている**
 
-### モデル設定
+| データ | スコア平均 | スコア標準偏差 |
+|--------|-----------|---------------|
+| 訓練正常データ | 0.43 | 0.04 |
+| テスト正常区間 | 1.04 | 1.60 |
+| テスト異常区間 | 4.79 | 3.86 |
 
-| パラメータ | 値 |
-|---|---|
-| 窓幅 (WINDOW) | 50 点 (= 5 秒) |
-| stride (学習) | 10 |
-| Latent 次元 | 32 |
-| LSTM Hidden | 64 |
-| Epochs | 60 |
-| Optimizer | Adam (lr=1e-3) |
-| LR Scheduler | ReduceLROnPlateau (patience=8) |
+**原因の推測:**  
+LSTM-AE が 100 エポック学習で訓練データのパターンをよく記憶しているため、訓練データへの再構成誤差が非常に低い。`sensor_err_stats.npy`（z-スコア正規化基準）が訓練 MSE 基準なので、より高い MSE のテストデータに適用するとスコアが大きくなりすぎる。
 
-| 指標 | 旧結果 |
-|---|---|
-| Best val_loss | ~0.166 |
-| F1 (閾値=95%ile) | 0.400 |
-| Precision | 0.674 |
-| Recall | 0.284 |
+**試みた対応と結果:**
 
-> **旧アプローチの課題**: 正常スコアと閾値の余裕が薄く Recall が低かった。
-> decorrelation + z スコア正規化 + 閾値 80%ile で改善を期待。
+| 試行 | 閾値 | FPR | 検知率 | 遅延 |
+|------|------|-----|--------|------|
+| 訓練 97%tile | 1.39 | 20.8% | 15/15 | 0.11s |
+| テスト正常 97%tile | 4.91 | 2.9% | 10/15 | 15.1s |
+| テスト正常 95%tile | 4.13 | 4.9% | 11/15 | 11.8s |
+| 旧モデル（変更前） | 1.010 | 7.1% | 14/15 | 5.6s |
 
----
-
-## 次にやること
-
-1. **パイプラインを再実行して新アプローチの F1 を計測**
-   ```
-   python 04_timeseries_data.py && python 05_train_lstm_ae.py
-   python 06_inference_lstm.py   # 単センサー比較も確認
-   ```
-
-2. **07_realtime.py で検知率を確認**
-   ```
-   python 07_realtime.py --fast --plot
-   ```
-
-3. （オプション）**モデル強化**
-   - Epochs を 100〜150 に増やす
-   - Latent 次元を 64 に拡大
+**直前の最後の操作:**  
+`sensor_err_stats.npy` をテストデータの正常区間 3000 窓から再計算して保存した。
+```
+新 sensor_err_stats: mean=0.117061, std=0.123953
+```
+→ この新しい stats での閾値キャリブレーションをやりかけで中断。
 
 ---
 
-## 備考・ハマりポイント
+## 再開時の手順
 
-- **Windows で PyTorch が動かない**: Visual C++ 再頒布可能パッケージが必要（→ インストール済み）
-- **matplotlib の日本語**: `font.family = 'Meiryo'` で対応（Linux では要変更）
-- **ONNX export 警告**: LSTM の batch_size に関する警告は動作に影響なし
-- **閾値の空間**: ts_threshold.npy は z スコア空間の値。07_realtime.py も z スコアで統一済み
+### ステップ 1: 新 sensor_err_stats でスコアを再確認
+
+```powershell
+$env:PYTHONIOENCODING = "utf-8"
+python -c "
+import numpy as np, onnxruntime as ort
+from pathlib import Path
+# ... (訓練正常データと新 stats でリアルタイム方式スコアを計算し分布確認)
+"
+```
+
+### ステップ 2: 97〜99%tile 閾値を試して 07_realtime.py で確認
+
+目標: 検知率 ≥ 93%、FPR ≤ 7%
+
+```powershell
+python 07_realtime.py --fast --plot
+```
+
+### ステップ 3: うまくいかない場合の代替案
+
+**A) sensor_err_stats の混合計算**  
+訓練正常 + テスト冒頭 60s（無条件正常とみなせる）の混合で stats を計算
+
+**B) エポック数を減らして過学習を緩和 → 再学習**  
+`EPOCHS = 50〜60` に変更して `05_train_lstm_ae.py` を再実行
+
+**C) z スコア方式をやめて生 MSE ベースに戻す**  
+`score = sq_err.mean()` のシンプルな集計で安定した分布を確保
+
+**D) 閾値を 05_train_lstm_ae.py でも同一の sensor_err_stats（テスト正常）で計算し直す**
+
+---
+
+## 変更したファイルの最終状態
+
+| ファイル | 変更内容 | 状態 |
+|---------|---------|------|
+| `05_train_lstm_ae.py` | CORR_LAMBDA, group_corr_loss, window_scores 更新, 閾値 99%tile | ✅ 保存済み |
+| `06_inference_lstm.py` | groups 読み込み, compute_scores 更新 | ✅ 保存済み |
+| `07_realtime.py` | groups 読み込み, score_window 更新 | ✅ 保存済み |
+| `visualize_data.py` | ローリング相関・散布図グラフ追加 | ✅ 保存済み |
+| `models/lstm_ae_best.pth` | 新モデル（CORR_LAMBDA=0.2, 100エポック） | ✅ 保存済み |
+| `models/lstm_ae.onnx` | 新モデルの ONNX エクスポート | ✅ 保存済み |
+| `models/sensor_err_stats.npy` | テスト正常 3000 窓から再計算 | ⚠️ 暫定（要確認） |
+| `models/ts_threshold.npy` | 暫定値（未確定） | ❌ 要キャリブレーション |
+
+---
+
+## 参考: 変更前のベースライン性能
+
+旧モデル（mean 集計、95%tile 閾値、相関損失なし）:
+- 検知率: 14/15（93%）
+- 正常時誤報率: 7.13%
+- 平均検出遅延: 5.64 秒
+- 閾値: 1.010
